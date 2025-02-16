@@ -1,8 +1,12 @@
 import collections.abc
+import importlib
+import typing
 
 from decimal import Decimal
 from functools import singledispatchmethod
-from typing import Optional, Sequence, Mapping
+from os import path
+from typing import Optional, Sequence, Mapping, Union
+from urllib.parse import urlparse
 
 from . import types
 from . import parser
@@ -12,20 +16,28 @@ from .parser import ast
 from .query_compile import (
     EvalAggregator,
     EvalAnd,
+    EvalAll,
+    EvalAny,
     EvalCoalesce,
     EvalColumn,
     EvalConstant,
+    EvalCreateTable,
     EvalGetItem,
     EvalGetter,
+    EvalInsert,
     EvalOr,
     EvalPivot,
-    EvalPrint,
     EvalQuery,
+    EvalConstantSubquery1D,
+    EvalRow,
     EvalTarget,
     FUNCTIONS,
     OPERATORS,
     SubqueryTable,
 )
+
+# Load functions and types definitions.
+from . import query_env  # noqa: F401
 
 
 # A global constant which sets whether we support inferred/implicit group-by
@@ -34,15 +46,23 @@ SUPPORT_IMPLICIT_GROUPBY = True
 
 
 class CompilationError(ProgrammingError):
-    def __init__(self, message, ast=None):
+    def __init__(self, message, node=None):
         super().__init__(message)
-        self.parseinfo = ast.parseinfo if ast is not None else None
+        self.parseinfo = node.parseinfo if node is not None else None
 
 
 class Compiler:
     def __init__(self, context):
         self.context = context
-        self.table = context.tables.get('postings')
+        self.stack = [context.tables.get(None)]
+
+    @property
+    def table(self):
+        return self.stack[-1]
+
+    @table.setter
+    def table(self, value):
+        self.stack[-1] = value
 
     def compile(self, query, parameters=None):
         """Compile an AST into an executable statement."""
@@ -78,6 +98,7 @@ class Compiler:
 
     @_compile.register
     def _select(self, node: ast.Select):
+        self.stack.append(self.table)
 
         # Compile the FROM clause.
         c_from_expr = self._compile_from(node.from_clause)
@@ -134,6 +155,7 @@ class Compiler:
         if pivots:
             return EvalPivot(query, pivots)
 
+        self.stack.pop()
         return query
 
     def _compile_from(self, node):
@@ -154,6 +176,16 @@ class Compiler:
 
         # FROM expression.
         if isinstance(node, ast.From):
+            # Check if the FROM expression is a column name belongin to the current table.
+            if isinstance(node.expression, ast.Column):
+                column = self.table.columns.get(node.expression.name)
+                if column is None:
+                    # When it is not, threat it as a table name.
+                    table = self.context.tables.get(node.expression.name)
+                    if table is not None:
+                        self.table = table
+                        return None
+
             c_expression = self._compile(node.expression)
 
             # Check that the FROM clause does not contain aggregates.
@@ -164,7 +196,8 @@ class Compiler:
                 raise CompilationError('CLOSE date must follow OPEN date')
 
             # Apply OPEN, CLOSE, and CLEAR clauses.
-            self.table = self.table.update(open=node.open, close=node.close, clear=node.clear)
+            if node.open is not None or node.close is not None or node.clear is not None:
+                self.table = self.table.evolve(open=node.open, close=node.close, clear=node.clear)
 
             return c_expression
 
@@ -219,10 +252,6 @@ class Compiler:
         if not order_by:
             return [], None
 
-        new_targets = c_targets[:]
-        c_target_expressions = [c_target.c_expr for c_target in c_targets]
-        order_spec = []
-
         # Compile order-by expressions and resolve them to their targets if
         # possible. A ORDER-BY column may be one of the following:
         #
@@ -232,7 +261,16 @@ class Compiler:
         #
         # References by name are converted to indexes. New expressions are
         # inserted into the list of targets as invisible targets.
-        targets_name_map = {target.name: index for index, target in enumerate(c_targets)}
+
+        new_targets = c_targets[:]
+        c_target_expressions = [c_target.c_expr for c_target in c_targets]
+        targets_name_map = {target.name: idx for idx, target in enumerate(c_targets) if target.name is not None}
+        # Only targets appearing in the SELECT targets list can be
+        # referenced by index. These are guaranteed to have a valid name.
+        n_targets = len(targets_name_map)
+
+        order_spec = []
+
         for spec in order_by:
             column = spec.column
             descending = spec.ordering
@@ -241,7 +279,7 @@ class Compiler:
             # Process target references by index.
             if isinstance(column, int):
                 index = column - 1
-                if not 0 <= index < len(c_targets):
+                if not 0 <= index < n_targets:
                     raise CompilationError(f'invalid ORDER-BY column index {column}')
 
             else:
@@ -442,7 +480,7 @@ class Compiler:
         column = self.table.columns.get(node.name)
         if column is not None:
             return column
-        raise CompilationError(f'column "{node.name}" does not exist', node)
+        raise CompilationError(f'column "{node.name}" not found in table "{self.table.name}"', node)
 
     @_compile.register
     def _or(self, node: ast.Or):
@@ -452,23 +490,105 @@ class Compiler:
     def _and(self, node: ast.And):
         return EvalAnd([self._compile(arg) for arg in node.args])
 
+    _OPERATORS = {
+        '<': ast.Less,
+        '<=': ast.LessEq,
+        '>': ast.Greater,
+        '>=': ast.GreaterEq,
+        '=': ast.Equal,
+        '!=': ast.NotEqual,
+        '~': ast.Match,
+        '!~': ast.NotMatch,
+        '?~': ast.Matches,
+    }
+
+    # dispatching on an Union is supported only starting with Python 3.11
+    @_compile.register(ast.All)
+    @_compile.register(ast.Any)
+    def _all(self, node):
+        right = self._compile(node.right)
+
+        if isinstance(right, EvalQuery):
+            if len(right.columns) != 1:
+                raise CompilationError('subquery has too many columns', node.right)
+            right = EvalConstantSubquery1D(right)
+
+        right_dtype = typing.get_origin(right.dtype) or right.dtype
+        if right_dtype not in {list, set}:
+            raise CompilationError(f'not a list or set but {right_dtype}', node.right)
+        args = typing.get_args(right.dtype)
+        if args:
+            assert len(args) == 1
+            right_element_dtype = args[0]
+        else:
+            right_element_dtype = object
+
+        left = self._compile(node.left)
+
+        # lookup operator implementaton and check typing
+        op = self._OPERATORS[node.op]
+        for func in OPERATORS[op]:
+            if func.__intypes__ == [right_element_dtype, left.dtype]:
+                break
+        else:
+            raise CompilationError(
+                f'operator "{op.__name__.lower()}('
+                f'{left.dtype.__name__}, {right_element_dtype.__name__})" not supported', node)
+
+        # need to instantiate the operaotr implementation to get to the underlying function
+        operator = func(None, None).operator
+
+        cls = EvalAll if type(node) is ast.All else EvalAny
+        return cls(operator, left, right)
+
     @_compile.register
     def _function(self, node: ast.Function):
         operands = [self._compile(operand) for operand in node.operands]
+
+        # ``row(*)`` is parsed like a function call but does something special
+        if node.fname == 'row' and len(operands) == 1 and operands[0].dtype == types.Asterisk:
+            return EvalRow()
+
+        # ``coalesce()`` is parsed like a function call but it does
+        # not really fit our model for function evaluation, therefore
+        # it gets special threatment here.
         if node.fname == 'coalesce':
-            # coalesce() is parsed like a function call but it does
-            # not really fit our model for function evaluation,
-            # therefore it gets special threatment here.
             for operand in operands:
                 if operand.dtype != operands[0].dtype:
                     dtypes = ', '.join(operand.dtype.__name__ for operand in operands)
                     raise CompilationError(f'coalesce() function arguments must have uniform type, found: {dtypes}', node)
             return EvalCoalesce(operands)
+
         function = types.function_lookup(FUNCTIONS, node.fname, operands)
         if function is None:
             sig = '{}({})'.format(node.fname, ', '.join(f'{operand.dtype.__name__.lower()}' for operand in operands))
             raise CompilationError(f'no function matches "{sig}" name and argument types', node)
-        function = function(operands)
+
+        # Replace ``meta(key)`` with ``meta[key]``.
+        if node.fname == 'meta':
+            key = node.operands[0]
+            node = ast.Function('getitem', [ast.Column('meta', parseinfo=node.parseinfo), key])
+            return self._compile(node)
+
+        # Replace ``entry_meta(key)`` with ``entry.meta[key]``.
+        if node.fname == 'entry_meta':
+            key = node.operands[0]
+            node = ast.Function('getitem', [ast.Attribute(ast.Column('entry', parseinfo=node.parseinfo), 'meta'), key])
+            return self._compile(node)
+
+        # Replace ``any_meta(key)`` with ``getitem(meta, key, entry.meta[key])``.
+        if node.fname == 'any_meta':
+            key = node.operands[0]
+            node = ast.Function('getitem', [ast.Column('meta', parseinfo=node.parseinfo), key, ast.Function('getitem', [
+                ast.Attribute(ast.Column('entry', parseinfo=node.parseinfo), 'meta'), key])])
+            return self._compile(node)
+
+        # Replace ``has_account(regexp)`` with ``('(?i)' + regexp) ~? any (accounts)``.
+        if node.fname == 'has_account':
+            node = ast.Any(ast.Add(ast.Constant('(?i)'), node.operands[0]), '?~', ast.Column('accounts'))
+            return self._compile(node)
+
+        function = function(self.context, operands)
         # Constants folding.
         if all(isinstance(operand, EvalConstant) for operand in operands) and function.pure:
             return EvalConstant(function(None), function.dtype)
@@ -498,7 +618,7 @@ class Compiler:
         function = types.function_lookup(OPERATORS, type(node), [operand])
         if function is None:
             raise CompilationError(
-                f'operator "{type(node).__name__.lower()}({operand.dtype.__name__})" not supported', node)
+                f'operator "{type(node).__name__.lower()}({types.name(operand.dtype)})" not supported', node)
         function = function(operand)
         # Constants folding.
         if isinstance(operand, EvalConstant):
@@ -518,6 +638,20 @@ class Compiler:
         raise CompilationError(
             f'operator "{types.name(operand.dtype)} BETWEEN {types.name(lower.dtype)} '
             f'AND {types.name(upper.dtype)}" not supported', node)
+
+    @_compile.register(ast.In)
+    @_compile.register(ast.NotIn)
+    def _inop(self, node: Union[ast.In, ast.NotIn]):
+        left = self._compile(node.left)
+        right = self._compile(node.right)
+
+        if isinstance(right, EvalQuery):
+            if len(right.columns) != 1:
+                raise CompilationError('subquery has too many columns', node.right)
+            right = EvalConstantSubquery1D(right)
+
+        op = OPERATORS[type(node)][0]
+        return op(left, right)
 
     @_compile.register
     def _binaryop(self, node: ast.BinaryOp):
@@ -546,7 +680,7 @@ class Compiler:
                 name = types.MAP.get(target)
                 if name is None:
                     break
-                left = types.function_lookup(FUNCTIONS, name, [left])([left])
+                left = types.function_lookup(FUNCTIONS, name, [left])(self.context, [left])
                 continue
             if right.dtype is object and left.dtype is not object:
                 target = left.dtype
@@ -558,7 +692,7 @@ class Compiler:
                 name = types.MAP.get(target)
                 if name is None:
                     break
-                right = types.function_lookup(FUNCTIONS, name, [right])([right])
+                right = types.function_lookup(FUNCTIONS, name, [right])(self.context, [right])
                 continue
 
             # Failure.
@@ -566,10 +700,18 @@ class Compiler:
 
         raise CompilationError(
             f'operator "{type(node).__name__.lower()}('
-            f'{left.dtype.__name__}, {right.dtype.__name__})" not supported', node)
+            f'{types.name(left.dtype)}, {types.name(right.dtype)})" not supported', node)
 
     @_compile.register
     def _constant(self, node: ast.Constant):
+        # For backward compatibility, the parser allows strings to be
+        # delimited by single or double quotes. This creates ambiguity between
+        # quoted identifiers and string. Strings delimited by double quotes
+        # are treated as column names when they resolve to an existing column
+        # in the current table.
+        if isinstance(node.value, str) and node.text and node.text[0] == '"':
+            if node.value in self.table.columns:
+                return self._column(ast.Column(node.value))
         return EvalConstant(node.value)
 
     @_compile.register
@@ -592,7 +734,51 @@ class Compiler:
     def _print(self, node: ast.Print):
         self.table = self.context.tables.get('entries')
         expr = self._compile_from(node.from_clause)
-        return EvalPrint(self.table, expr)
+        targets = [EvalTarget(EvalRow(), 'ROW(*)', False)]
+        return EvalQuery(self.table, targets, expr, None, None, None, None, False)
+
+    @_compile.register
+    def _create_table(self, node: ast.CreateTable):
+        query = None
+        columns = None
+        if node.columns is not None:
+            columns = []
+            for cname, ctype in node.columns:
+                datatype = types.parse(ctype)
+                if datatype is None:
+                    raise CompilationError(f'unrecognized type "{ctype}"', node)
+                columns.append((cname, datatype))
+        if node.query is not None:
+            query = self._compile(node.query)
+            columns = [(t.name, t.c_expr.dtype) for t in query.c_targets if t.name is not None]
+        parts = urlparse(node.using)
+        scheme = parts.scheme or path.splitext(parts.path)[1][1:] or 'memory'
+        impl = importlib.import_module(f'beanquery.sources.{scheme}').create
+        return EvalCreateTable(self.context, node.name, columns, node.using, query, impl)
+
+    @_compile.register
+    def _insert(self, node: ast.Insert):
+        table = self.context.tables.get(node.table.name)
+        if table is None:
+            raise CompilationError(f'table "{node.table.name}" does not exist', node.table)
+        impl = getattr(table, 'insert', None)
+        if impl is None:
+            raise CompilationError(f'table "{node.table.name}" does not support insertion', node.table)
+        if len(node.values) != len(node.columns):
+            raise CompilationError(
+                f'column names and values mismatch: '
+                f'expected {len(node.columns)} but {len(node.values)} values were supplied', node)
+        values = [EvalConstant(None)] * len(table.columns)
+        columns = {name: i for i, name in enumerate(table.columns.keys())}
+        for column, value in zip(node.columns, node.values):
+            index = columns.get(column.name)
+            if index is None:
+                raise CompilationError(f'column "{column.name}" not found in table "{node.table.name}"', column)
+            expr = self._compile(value)
+            if not expr.dtype == table.columns.get(column.name).dtype:
+                raise CompilationError(f'expression has wrong type for column "{column.name}"', value)
+            values[index] = expr
+        return EvalInsert(table, values)
 
 
 def transform_journal(journal):

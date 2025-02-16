@@ -3,7 +3,12 @@ __license__ = "GNU GPLv2"
 
 import datetime
 import unittest
-from decimal import Decimal
+
+from decimal import Decimal as D
+
+from beancount import loader
+
+import beanquery
 
 from beanquery import Connection, CompilationError, ProgrammingError
 from beanquery import compiler
@@ -12,9 +17,11 @@ from beanquery import query_env as qe
 from beanquery import parser
 from beanquery import tables
 from beanquery.parser import ast
+from beanquery.sources import test
 
 
 class Table:
+    # mock table to be used in tests
     def __init__(self, name):
         self.name = name
 
@@ -24,70 +31,64 @@ class Table:
         return other.name == self.name
 
 
+class Column(qc.EvalColumn):
+    # mock column to be used in tests
+    def __init__(self, name, dtype=str):
+        self.name = name
+        self.dtype = dtype
+
+    def __eq__(self, other):
+        if not isinstance(other, qc.EvalColumn):
+            return False
+        return getattr(other, 'name', type(other).__name__) == self.name
+
+
 class TestCompileExpression(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        context = Connection()
-        cls.compiler = compiler.Compiler(context)
-        cls.compiler.table = qe.PostingsEnvironment()
+        cls.context = Connection()
+        cls.context.tables['test'] = test.Table(0)
+        # parser for expressions
+        cls.parser = parser.BQLParser(start='expression')
+        cls.compiler = compiler.Compiler(cls.context)
+        cls.compiler.table = cls.context.tables['test']
 
     def compile(self, expr):
+        expr = self.parser.parse(expr, semantics=parser.BQLSemantics())
         return self.compiler.compile(expr)
 
     def test_expr_invalid(self):
         with self.assertRaises(CompilationError):
-            self.compile(ast.Column('invalid'))
+            self.compile('''invalid''')
 
     def test_expr_column(self):
-        self.assertEqual(
-            qe.Column('filename'),
-            self.compile(ast.Column('filename')))
+        self.assertEqual(self.compile('''x'''), Column('x', int))
 
     def test_expr_function(self):
-        self.assertEqual(
-            qe.SumPosition([qe.Column('position')]),
-            self.compile(ast.Function('sum', [ast.Column('position')])))
+        self.assertEqual(self.compile('''sum(x)'''), qe.SumInt(None, [Column('x', int)]))
 
     def test_expr_unaryop(self):
-        self.assertEqual(
-            qc.Operator(ast.Not, [qe.Column('account')]),
-            self.compile(ast.Not(ast.Column('account'))))
+        self.assertEqual(self.compile('''not x'''), qc.Operator(ast.Not, [Column('x', int)]))
 
     def test_expr_binaryop(self):
-        self.assertEqual(
-            qc.Operator(ast.Equal, [
-                qe.Column('date'),
-                qc.EvalConstant(datetime.date(2014, 1, 1))
-            ]),
-            self.compile(ast.Equal(ast.Column('date'), ast.Constant(datetime.date(2014, 1, 1)))))
+        self.assertEqual(self.compile('''x = 1'''), qc.Operator(ast.Equal, [Column('x', int), qc.EvalConstant(1)]))
 
     def test_expr_constant(self):
-        self.assertEqual(
-            qc.EvalConstant(Decimal(17)),
-            self.compile(ast.Constant(Decimal(17))))
+        self.assertEqual(self.compile('''17'''), qc.EvalConstant(D('17')))
 
     def test_expr_function_arity(self):
-        # Compile with the correct number of arguments.
-        self.compile(ast.Function('sum', [ast.Column('number')]))
-
-        # Compile with an incorrect number of arguments.
+        # compile with an incorrect number of arguments.
         with self.assertRaises(CompilationError):
-            self.compile(ast.Function('sum', [ast.Column('date'), ast.Column('account')]))
+            self.compile('''sum(1, 2)''')
 
     def test_constants_folding(self):
         # unary op
-        self.assertEqual(
-            self.compile(ast.Neg(ast.Constant(2))),
-            qc.EvalConstant(-2))
+        self.assertEqual(self.compile('''-2'''), qc.EvalConstant(D('-2')))
         # binary op
-        self.assertEqual(
-            self.compile(ast.Add(ast.Constant(2), ast.Constant(2))),
-            qc.EvalConstant(4))
+        self.assertEqual(self.compile('''2 + 2'''), qc.EvalConstant(D('4')))
         # funtion
-        self.assertEqual(
-            self.compile(ast.Function('root', [ast.Constant('Assets:Cash'), ast.Constant(1)])),
-            qc.EvalConstant('Assets'))
+        self.assertEqual(self.compile('''root('Assets:Cash', 1)'''), qc.EvalConstant('Assets'))
 
 
 class TestCompileAggregateChecks(unittest.TestCase):
@@ -96,13 +97,13 @@ class TestCompileAggregateChecks(unittest.TestCase):
         columns, aggregates = compiler.get_columns_and_aggregates(
             qc.EvalAnd([
                 qc.Operator(ast.Equal, [
-                    qe.Column('lineno'),
+                    Column('lineno', int),
                     qc.EvalConstant(42),
                 ]),
                 qc.EvalOr([
                     qc.Operator(ast.Not, [
                         qc.Operator(ast.Equal, [
-                            qe.Column('date'),
+                            Column('date', datetime.date),
                             qc.EvalConstant(datetime.date(2014, 1, 1)),
                         ]),
                     ]),
@@ -114,59 +115,59 @@ class TestCompileAggregateChecks(unittest.TestCase):
         columns, aggregates = compiler.get_columns_and_aggregates(
             qc.EvalAnd([
                 qc.Operator(ast.Equal, [
-                    qe.Column('lineno'),
+                    Column('lineno', int),
                     qc.EvalConstant(42),
                 ]),
                 qc.EvalOr([
                     qc.Operator(ast.Not, [
                         qc.Operator(ast.Not, [
                             qc.Operator(ast.Equal, [
-                                qe.Column('date'),
+                                Column('date', datetime.date),
                                 qc.EvalConstant(datetime.date(2014, 1, 1)),
                             ]),
                         ]),
                     ]),
                     # Aggregation node deep in the tree.
-                    qe.SumInt([qc.EvalConstant(1)]),
+                    qe.SumInt(None, [qc.EvalConstant(1)]),
                 ]),
             ]))
         self.assertEqual((2, 1), (len(columns), len(aggregates)))
 
     def test_get_columns_and_aggregates(self):
         # Simple column.
-        c_query = qe.Column('position')
+        c_query = Column('position')
         columns, aggregates = compiler.get_columns_and_aggregates(c_query)
         self.assertEqual((1, 0), (len(columns), len(aggregates)))
         self.assertFalse(compiler.is_aggregate(c_query))
 
         # Multiple columns.
-        c_query = qc.EvalAnd([qe.Column('position'), qe.Column('date')])
+        c_query = qc.EvalAnd([Column('position'), Column('date')])
         columns, aggregates = compiler.get_columns_and_aggregates(c_query)
         self.assertEqual((2, 0), (len(columns), len(aggregates)))
         self.assertFalse(compiler.is_aggregate(c_query))
 
         # Simple aggregate.
-        c_query = qe.SumPosition([qe.Column('position')])
+        c_query = qe.SumPosition(None, [Column('position')])
         columns, aggregates = compiler.get_columns_and_aggregates(c_query)
         self.assertEqual((0, 1), (len(columns), len(aggregates)))
         self.assertTrue(compiler.is_aggregate(c_query))
 
         # Multiple aggregates.
-        c_query = qc.EvalAnd([qe.First([qe.Column('date')]), qe.Last([qe.Column('flag')])])
+        c_query = qc.EvalAnd([qe.First(None, [Column('date')]), qe.Last(None, [Column('flag')])])
         columns, aggregates = compiler.get_columns_and_aggregates(c_query)
         self.assertEqual((0, 2), (len(columns), len(aggregates)))
         self.assertTrue(compiler.is_aggregate(c_query))
 
         # Simple non-aggregate function.
-        c_query = qe.Function('length', [qe.Column('account')])
+        c_query = qe.Function('length', [Column('account')])
         columns, aggregates = compiler.get_columns_and_aggregates(c_query)
         self.assertEqual((1, 0), (len(columns), len(aggregates)))
         self.assertFalse(compiler.is_aggregate(c_query))
 
         # Mix of column and aggregates (this is used to detect this illegal case).
         c_query = qc.EvalAnd([
-            qe.Function('length', [qe.Column('account')]),
-            qe.SumPosition([qe.Column('position')]),
+            qe.Function('length', [Column('account')]),
+            qe.SumPosition(None, [Column('position')]),
         ])
         columns, aggregates = compiler.get_columns_and_aggregates(c_query)
         self.assertEqual((1, 1), (len(columns), len(aggregates)))
@@ -178,9 +179,8 @@ class CompileSelectBase(unittest.TestCase):
     maxDiff = 8192
 
     def setUp(self):
-        self.ctx = Connection()
-        self.ctx.tables['entries'] = qe.EntriesTable(None, None)
-        self.ctx.tables['postings'] = qe.PostingsTable(None, None)
+        entries, errors, options = loader.load_string('')
+        self.ctx = Connection('beancount:', entries=entries, errors=errors, options=options)
 
     def compile(self, query):
         """Parse one query and compile it.
@@ -275,42 +275,6 @@ class CompileSelectBase(unittest.TestCase):
             raise
 
 
-class TestCompileFundamentals(CompileSelectBase):
-
-    def test_operaotors(self):
-        expr = self.compile("SELECT 1 + 1 AS expr")
-        self.assertEqual(expr, qc.EvalQuery(Table('postings'), [
-            qc.EvalTarget(qc.EvalConstant(2), 'expr', False)
-        ], None, None, None, None, None, None))
-
-        expr = self.compile("SELECT 1 + meta('int') AS expr")
-        self.assertEqual(expr, qc.EvalQuery(Table('postings'), [
-            qc.EvalTarget(
-                qc.Operator(ast.Add, [
-                    qc.EvalConstant(1),
-                    qe.Function('decimal', [
-                        qe.Function('meta', [
-                            qc.EvalConstant('int'),
-                        ]),
-                    ]),
-                ]), 'expr', False)
-        ], None, None, None, None, None, None))
-
-    def test_coalesce(self):
-        expr = self.compile("SELECT coalesce(narration, str(date), '~') AS expr")
-        self.assertEqual(expr, qc.EvalQuery(Table('postings'), [
-            qc.EvalTarget(
-                qc.EvalCoalesce([
-                    qe.Column('narration'),
-                    qe.Function('str', [qe.Column('date')]),
-                    qc.EvalConstant('~'),
-                ]), 'expr', False)
-        ], None, None, None, None, None, None))
-
-        with self.assertRaises(CompilationError):
-            self.compile("SELECT coalesce(narration, date, 1)")
-
-
 class TestCompileSelect(CompileSelectBase):
 
     def test_compile_from(self):
@@ -344,16 +308,15 @@ class TestCompileSelect(CompileSelectBase):
         query = self.compile("SELECT *;")
         self.assertTrue(list, type(query.c_targets))
         self.assertGreater(len(query.c_targets), 3)
-        self.assertTrue(all(isinstance(target.c_expr, qc.EvalColumn)
-                            for target in query.c_targets))
+        self.assertTrue(all(isinstance(target.c_expr, qc.EvalColumn) for target in query.c_targets))
 
     def test_compile_targets_named(self):
         # Test the wildcard expansion.
         query = self.compile("SELECT length(account), account as a, date;")
         self.assertEqual(
-            [qc.EvalTarget(qe.Function('length', [qe.Column('account')]), 'length(account)', False),
-             qc.EvalTarget(qe.Column('account'), 'a', False),
-             qc.EvalTarget(qe.Column('date'), 'date', False)],
+            [qc.EvalTarget(qe.Function('length', [Column('account')]), 'length(account)', False),
+             qc.EvalTarget(Column('account'), 'a', False),
+             qc.EvalTarget(Column('date'), 'date', False)],
             query.c_targets)
 
     def test_compile_mixed_aggregates(self):
@@ -739,16 +702,23 @@ class TestTranslationBalance(CompileSelectBase):
         None, self.group_by, self.order_by, None, None, None))
 
     def test_print(self):
-        self.assertCompile(qc.EvalPrint(Table('entries'), None), "PRINT;")
+        self.assertCompile(
+            qc.EvalQuery(
+                Table('entries'),
+                [qc.EvalTarget(qc.EvalRow(), 'ROW(*)', False)],
+                None, None, None, None, None, False),
+            "PRINT;",
+        )
 
     def test_print_from(self):
         self.assertCompile(
-            qc.EvalPrint(
+            qc.EvalQuery(
                 Table('entries'),
+                [qc.EvalTarget(qc.EvalRow(), 'ROW(*)', False)],
                 qc.Operator(ast.Equal, [
-                    qe.Column('year'),
-                    qc.EvalConstant(2014),
-                ])),
+                    Column('year', int),
+                    qc.EvalConstant(2014) ]),
+                None, None, None, None, False),
             "PRINT FROM year = 2014;")
 
 
@@ -790,3 +760,93 @@ class TestCompileParameters(unittest.TestCase):
     def test_missing_parameters_named(self):
         with self.assertRaises(ProgrammingError):
             self.compile('''SELECT %(x)s + %(y)s''', {'x': 1})
+
+
+class TestSelectFrom(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = beanquery.connect('')
+        # create a table ``postings`` with coulums ``date`` and ``account``
+        cls.conn.execute('''CREATE TABLE postings (date date, account str)''')
+        # make it the default table
+        cls.conn.tables[None] = cls.conn.tables['postings']
+        # create a table ``foo`` with columns ``x`` and ``y``
+        cls.conn.execute('''CREATE TABLE foo (x int, y int)''')
+
+    def compile(self, query):
+        c = compiler.Compiler(self.conn)
+        return c.compile(parser.parse(query))
+
+    def test_select_from(self):
+        query = self.compile('''SELECT x FROM foo''')
+        self.assertEqual(query.table, self.conn.tables['foo'])
+
+    def test_select_from_invalid(self):
+        with self.assertRaisesRegex(beanquery.ProgrammingError, 'column "qux" not found in table "postings"'):
+            self.compile('''SELECT x FROM qux''')
+
+    def test_select_from_column(self):
+        query = self.compile('''SELECT account FROM date''')
+        self.assertEqual(query.table, self.conn.tables['postings'])
+
+    def test_select_from_hash(self):
+        query = self.compile('''SELECT x FROM #foo''')
+        self.assertEqual(query.table, self.conn.tables['foo'])
+
+    def test_select_from_hash_invalid(self):
+        with self.assertRaisesRegex(beanquery.ProgrammingError, 'table "qux" does not exist'):
+            self.compile('''SELECT x FROM #qux''')
+
+    def test_select_from_hash_column_invalid(self):
+        with self.assertRaisesRegex(beanquery.ProgrammingError, 'table "date" does not exist'):
+            self.compile('''SELECT account FROM #date''')
+
+    def test_select_from_hash_column(self):
+        self.conn.execute('''CREATE table date (year int, month int, day int)''')
+        def cleanup():
+            del self.conn.tables['date']
+        self.addCleanup(cleanup)
+        query = self.compile('''SELECT year FROM #date''')
+        self.assertEqual(query.table, self.conn.tables['date'])
+
+
+class TestQuotedIdentifiers(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = beanquery.connect('')
+        # create a table ``postings`` with coulums ``date`` and ``account``
+        cls.conn.execute('''CREATE TABLE postings (date date, account str)''')
+
+    def compile(self, query):
+        c = compiler.Compiler(self.conn)
+        return c.compile(parser.parse(query))
+
+    def test_from_quoted(self):
+        query = self.compile('''SELECT * FROM postings''')
+        self.assertIs(query.table, self.conn.tables['postings'])
+        query = self.compile('''SELECT * FROM "postings"''')
+        self.assertIs(query.table, self.conn.tables['postings'])
+
+    def test_quoted_target(self):
+        query = self.compile('''SELECT date FROM postings''')
+        self.assertEqual(query.c_targets[0].c_expr, self.conn.tables['postings'].columns['date'])
+        query = self.compile('''SELECT "date" FROM postings''')
+        self.assertEqual(query.c_targets[0].c_expr, self.conn.tables['postings'].columns['date'])
+
+    def test_quoted_string_target(self):
+        # if the double quoted string is not a table name, it is a string literal ideed
+        query = self.compile('''SELECT "baz" FROM postings''')
+        self.assertEqual(query.c_targets[0].c_expr.value, 'baz')
+
+    def test_quoted_in_expression(self):
+        query = self.compile('''SELECT date + 1 FROM postings''')
+        self.assertEqual(query.c_targets[0].c_expr.left, self.conn.tables['postings'].columns['date'])
+        query = self.compile('''SELECT "date" + 1 FROM postings''')
+        self.assertEqual(query.c_targets[0].c_expr.left, self.conn.tables['postings'].columns['date'])
+
+    def test_quoted_string_in_expression(self):
+        # if the double quoted string is not a table name, it is a string literal ideed
+        query = self.compile('''SELECT "a" + "b" FROM postings''')
+        self.assertEqual(query.c_targets[0].c_expr.value, 'ab')

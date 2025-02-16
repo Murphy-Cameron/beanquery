@@ -34,7 +34,6 @@ from beanquery import query_compile
 from beanquery import render
 from beanquery import types
 from beanquery.numberify import numberify_results
-from beanquery.query_execute import execute_print
 
 try:
     import readline
@@ -98,7 +97,7 @@ class Settings:
     narrow: bool = True
     nullvalue: str = ''
     numberify: bool = False
-    pager: str = ''
+    pager: bool = True
     spaced: bool = False
     unicode: bool = False
 
@@ -162,14 +161,26 @@ class DispatchingShell(cmd.Cmd):
         self.add_help()
 
         if interactive and readline is not None:
-            readline.parse_and_bind("tab: complete")
-            # Readline is used to complete command names, which are
-            # strictly alphanumeric strings, and named query
-            # identifiers, which may contain any ascii characters. To
-            # enable completion of the latter, reduce the set of
-            # completion word delimiters to the shell default. Notably
-            # remove "-" from the delimiters list setup by Python.a
+
+            # Setup completion on ``tab``. This needs to be done differently
+            # depending on whether the ``readline`` backend is GNU readline or
+            # libedit. This is handled automatically on Python 3.13 an
+            # later. For Python 3.12 and earlier, the recommended way to check
+            # for the string ``linedit`` in ``readline.__doc__``
+            if 'libedit' in readline.__doc__:
+                readline.parse_and_bind("bind ^I rl_complete")
+            else:
+                readline.parse_and_bind("tab: complete")
+
+            # ``readline`` is used to complete command names, which are
+            # strictly alphanumeric strings, and named query identifiers,
+            # which may contain any ASCII character. To enable completion of
+            # the latter, reduce the set of completion word delimiters to the
+            # shell default. Notably remove ``-`` from the delimiters list
+            # setup by Python.
             readline.set_completer_delims(" \t\n\"\\'`@$><=;|&{(")
+
+            # Setup ``readline`` history handling.
             history_filepath = path.expanduser(HISTORY_FILENAME)
             os.makedirs(path.dirname(history_filepath), exist_ok=True)
             with suppress(FileNotFoundError):
@@ -207,17 +218,6 @@ class DispatchingShell(cmd.Cmd):
                     lambda _, fun=func: print(textwrap.dedent(fun.__doc__).strip(),
                                               file=self.outfile))
 
-    def get_pager(self):
-        """Create and return a context manager to write to, a pager subprocess if required.
-
-        Returns:
-          A context manager.
-
-        """
-        if self.interactive:
-            return pager.ConditionalPager(self.settings.pager, minlines=get_screen_height())
-        return pager.flush_only(sys.stdout)
-
     @property
     def output(self):
         """Where to direct command output.
@@ -232,7 +232,9 @@ class DispatchingShell(cmd.Cmd):
 
         """
         if self.outfile is sys.stdout:
-            return self.get_pager()
+            if self.interactive and self.settings.pager:
+                return pager.ConditionalPager(None, minlines=get_screen_height())
+            return pager.flush_only(sys.stdout)
         return nullcontext(self.outfile)
 
     def cmdloop(self, intro=None):
@@ -242,7 +244,7 @@ class DispatchingShell(cmd.Cmd):
                 super().cmdloop(intro)
                 break
             except KeyboardInterrupt:
-                print('\n(interrupted)', file=self.stderr)
+                print('\n(interrupted)', file=sys.stderr)
             except Exception as exc:
                 self.error(render_exception(exc))
 
@@ -326,23 +328,35 @@ class DispatchingShell(cmd.Cmd):
     def complete_set(self, text, _line, _begidx, _endidx):
         return [name for name in self.settings if name.startswith(text)]
 
+    def do_format(self, arg):
+        """Set output format to FRMT."""
+        if not arg:
+            frmt = self.settings.getstr('format')
+            print(f'format: {frmt}', file=self.outfile)
+        else:
+            value, *others = shlex.split(arg)
+            if others:
+                self.error('invalid number of arguments')
+            try:
+                self.settings.setstr('format', value)
+            except ValueError as ex:
+                self.error(str(ex))
+
+    def complete_format(self, text, _line, _begidx, _endidx):
+        return [frmt for frmt in FORMATS if frmt.startswith(text)]
+
+    def do_output(self, arg):
+        """Send output to FILE or stdout if FILE is omitted."""
+        if self.outfile is not sys.stdout:
+            self.outfile.close()
+        self.outfile = open(arg, "w") if arg else open(sys.stdout)
+
     def do_parse(self, arg):
         """Run the parser on the following command and print the output."""
         print(self.parse(arg).tosexp())
 
-    def parse(self, query, **kwargs):
-        raise NotImplementedError
-
     def execute(self, query, **kwargs):
-        """Handle statements via our parser instance and dispatch to appropriate methods.
-
-        Args:
-          query: The string to be parsed.
-        """
-        statement = self.parse(query, **kwargs)
-        name = type(statement).__name__
-        method = getattr(self, f'on_{name}')
-        return method(statement)
+        raise NotImplementedError
 
     def do_exit(self, arg):
         """Exit the command interpreter."""
@@ -360,11 +374,12 @@ class BQLShell(DispatchingShell):
     """An interactive shell interpreter for the Beancount query language."""
     prompt = 'beanquery> '
 
-    def __init__(self, filename, outfile, interactive=False, runinit=False, format='text', numberify=False):
+    def __init__(self, source, outfile, interactive=False, runinit=False, format='text', numberify=False, errors=True):
         settings = Settings(format=format, numberify=numberify)
         super().__init__(outfile, interactive, runinit, settings)
         self.context = beanquery.connect(None)
-        self.filename = filename
+        self.source = source
+        self.show_load_errors = errors
         self.queries = {}
         self.do_reload()
 
@@ -376,19 +391,27 @@ class BQLShell(DispatchingShell):
             statement.from_clause.close = default_close_date
         return statement
 
+    def execute(self, query, **kwargs):
+        statement = self.parse(query, **kwargs)
+        name = type(statement).__name__
+        method = getattr(self, f'on_{name}', None)
+        if method is not None:
+            return method(statement)
+        return self.on_Select(statement)
+
     def do_reload(self, arg=None):
         "Reload the Beancount input file."
-        if not self.filename:
-            return
         self.context.errors.clear()
         self.context.options.clear()
-        self.context.attach('beancount:' + self.filename)
-        table = self.context.tables['entries']
-        self._extract_queries(table.entries)
-        if self.context.errors:
-            printer.print_errors(self.context.errors, file=sys.stderr)
-        if self.interactive:
-            print_statistics(table.entries, table.options, self.outfile)
+        if self.source:
+            self.context.attach(self.source)
+        if self.source.startswith('beancount:'):
+            table = self.context.tables['entries']
+            self._extract_queries(table.entries)
+            if self.context.errors and self.show_load_errors:
+                printer.print_errors(self.context.errors, file=sys.stderr)
+            if self.interactive:
+                print_statistics(table.entries, table.options, self.context.errors, self.outfile)
 
     def _extract_queries(self, entries):
         self.queries = {}
@@ -398,7 +421,7 @@ class BQLShell(DispatchingShell):
                 if x is not entry:
                     warnings.warn(f'duplicate query name "{entry.name}"', stacklevel=0)
 
-    def do_errors(self, arg=None):
+    def do_errors(self, arg):
         "Print the errors that occurred during Beancount input file parsing."
         if self.context.errors:
             printer.print_errors(self.context.errors)
@@ -440,7 +463,7 @@ class BQLShell(DispatchingShell):
 
     def do_tables(self, arg):
         """List tables."""
-        print('\n'.join(name for name in sorted(self.context.tables.keys()) if name), file=self.outfile)
+        print('\n'.join(sorted(filter(None, self.context.tables.keys()))), file=self.outfile)
 
     def do_describe(self, arg):
         """Describe table or structured type."""
@@ -478,6 +501,9 @@ class BQLShell(DispatchingShell):
         p(f'  {query}')
         p('')
 
+        if not isinstance(query, query_compile.EvalNode):
+            return
+
         p('targets')
         p('-------')
         for target in query.c_targets:
@@ -504,10 +530,12 @@ class BQLShell(DispatchingShell):
             CLEAR operations).
 
         """
-        # Compile the print statement.
-        query = self.context.compile(statement)
-        with self.output as out:
-            execute_print(query, out)
+        frmt = self.settings.format
+        try:
+            self.settings.format = 'beancount'
+            self.on_Select(statement)
+        finally:
+            self.settings.format = frmt
 
     def on_Select(self, statement):
         """
@@ -556,7 +584,7 @@ class BQLShell(DispatchingShell):
         cursor = self.context.execute(statement)
         desc = cursor.description
         rows = cursor.fetchall()
-        dcontext = self.context.options['dcontext']
+        dcontext = self.context.options.get('dcontext', None)
 
         if self.settings.numberify:
             desc, rows = numberify_results(desc, rows, dcontext.build())
@@ -669,7 +697,7 @@ def _describe_columns(columns):
     out = io.StringIO()
     wrapper = textwrap.TextWrapper(initial_indent='  ', subsequent_indent='  ', width=80)
     for name, column in columns.items():
-        print(f'{name}: {column.dtype.__name__.lower()}', file=out)
+        print(f'{name}: {types.name(column.dtype)}', file=out)
         print(wrapper.fill(re.sub(r'[ \n\t]+', ' ', column.__doc__ or '')), file=out)
         print(file=out)
     return out.getvalue().rstrip()
@@ -682,7 +710,7 @@ def _describe_functions(functions, aggregates=False):
             continue
         name = name.lower()
         for func in funcs:
-            args = ', '.join(d.__name__.lower() for d in func.__intypes__)
+            args = ', '.join(types.name(d) for d in func.__intypes__)
             doc = re.sub(r'[ \n\t]+', ' ', func.__doc__ or '')
             entries.append((name, doc, args))
     entries.sort()
@@ -719,10 +747,10 @@ def summary_statistics(entries):
         if isinstance(entry, data.Transaction):
             num_transactions += 1
             num_postings += len(entry.postings)
-    return (num_directives, num_transactions, num_postings)
+    return num_directives, num_transactions, num_postings
 
 
-def print_statistics(entries, options, outfile):
+def print_statistics(entries, options, errors, outfile):
     """Print summary statistics to stdout.
 
     Args:
@@ -733,22 +761,23 @@ def print_statistics(entries, options, outfile):
     num_directives, num_transactions, num_postings = summary_statistics(entries)
     if 'title' in options:
         print(f'''Input file: "{options['title']}"''', file=outfile)
-    print(f"Ready with {num_directives} directives",
-          f"({num_postings} postings in {num_transactions} transactions).",
+    print(f"Ready with {num_directives} directives "
+          f"({num_postings} postings in {num_transactions} transactions, "
+          f"{len(errors)} validation errors)",
           file=outfile)
 
 
 @click.command()
 @click.argument('filename')
 @click.argument('query', nargs=-1)
-@click.option('--numberify', '-m', is_flag=True,
-              help="Numberify the output, removing the currencies.")
-@click.option('--format', '-f', type=click.Choice(FORMATS.keys()), default='text',
-              help="Output format.")
 @click.option('--output', '-o', type=click.File('w'), default='-',
               help="Output filename.")
+@click.option('--format', '-f', type=click.Choice(FORMATS.keys()), default='text',
+              help="Output format.")
+@click.option('--numberify', '-m', is_flag=True,
+              help="Numberify the output, removing the currencies.")
 @click.option('--no-errors', '-q', is_flag=True,
-              help="Do not report errors.")
+              help="Do not report ledger validation errors on load.")
 @click.version_option('', message=f'beanquery {beanquery.__version__}, beancount {beancount.__version__}')
 def main(filename, query, numberify, format, output, no_errors):
     """An interactive interpreter for the Beancount Query Language.
@@ -759,9 +788,15 @@ def main(filename, query, numberify, format, output, no_errors):
     inferred from the output file name, if specified.
 
     """
+    # Prepend ``beancount:`` to DSNs not having a ``scheme:`` prefix.
+    # Take into account file paths starting with a single letter
+    # Windows-style drive designations, which can be spelled with
+    # forward or backward slashes.
+    source = filename if re.match('[a-z]{2,}:',filename) else 'beancount:' + filename
+
     # Create the shell.
     interactive = sys.stdin.isatty() and not query
-    shell = BQLShell(filename, output, interactive, True, format, numberify)
+    shell = BQLShell(source, output, interactive, True, format, numberify, not no_errors)
 
     # Run interactively if we're a TTY and no query is supplied.
     if interactive:

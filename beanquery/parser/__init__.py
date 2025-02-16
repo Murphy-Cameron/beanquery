@@ -4,8 +4,8 @@ import decimal
 import tatsu
 
 from ..errors import ProgrammingError
+from .parser import BQLParser
 from . import ast
-from . import parser
 
 
 class BQLSemantics:
@@ -23,7 +23,7 @@ class BQLSemantics:
         return decimal.Decimal(value)
 
     def date(self, value):
-        return datetime.datetime.strptime(value, '%Y-%m-%d').date()
+        return datetime.date.fromisoformat(value)
 
     def string(self, value):
         return value[1:-1]
@@ -31,8 +31,11 @@ class BQLSemantics:
     def boolean(self, value):
         return value == 'TRUE'
 
-    def identifier(self, value):
+    def unquoted_identifier(self, value):
         return value.lower()
+
+    def quoted_identifier(self, value):
+        return value.replace('""', '"')
 
     def asterisk(self, value):
         return ast.Asterisk()
@@ -58,7 +61,7 @@ class ParseError(ProgrammingError):
 
 def parse(text):
     try:
-        return parser.BQLParser().parse(text, semantics=BQLSemantics())
+        return BQLParser().parse(text, semantics=BQLSemantics())
     except tatsu.exceptions.ParseError as exc:
         line = exc.tokenizer.line_info(exc.pos).line
         parseinfo = tatsu.infos.ParseInfo(exc.tokenizer, exc.item, exc.pos, exc.pos + 1, line, [])

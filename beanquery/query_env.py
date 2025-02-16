@@ -7,50 +7,58 @@ Define new columns and functions here.
 __copyright__ = "Copyright (C) 2014-2017  Martin Blais"
 __license__ = "GNU GPLv2"
 
-import copy
 import datetime
 import decimal
 import re
 import textwrap
 
-from functools import lru_cache as cache
 from decimal import Decimal
 
 import dateutil.parser
+from dateutil.relativedelta import relativedelta, weekday
 
 from beancount.core.number import ZERO
-from beancount.core.compare import hash_entry
 from beancount.core import amount
 from beancount.core import position
 from beancount.core import inventory
 from beancount.core import account
-from beancount.core import account_types
-from beancount.core import data
-from beancount.core import getters
 from beancount.core import convert
 from beancount.core import prices
-from beancount.ops import summarize
-from beancount.parser import options as opts
+from beancount.core.account_types import get_account_sign, get_account_sort_key
 
 from beanquery import query_compile
-from beanquery import tables
 from beanquery import types
 
 
-def function(intypes, outtype, pass_context=False, name=None):
+class ColumnsRegistry(dict):
+
+    def register(self, dtype):
+        def decorator(func):
+            class Col(query_compile.EvalColumn):
+                def __init__(self):
+                    super().__init__(dtype)
+                __call__ = staticmethod(func)
+            Col.__name__ = func.__name__
+            Col.__doc__ = func.__doc__
+            self[Col.__name__] = Col()
+            return func
+        return decorator
+
+
+def function(intypes, outtype, pass_context=None, name=None):
     def decorator(func):
         class Func(query_compile.EvalFunction):
             __intypes__ = intypes
             pure = not pass_context
-            def __init__(self, operands):
-                super().__init__(operands, outtype)
-            def __call__(self, context):
-                args = [operand(context) for operand in self.operands]
+            def __init__(self, context, operands):
+                super().__init__(context, operands, outtype)
+            def __call__(self, row):
+                args = [operand(row) for operand in self.operands]
                 for arg in args:
                     if arg is None:
                         return None
                 if pass_context:
-                    return func(context, *args)
+                    return func(self.context, *args)
                 return func(*args)
         Func.__name__ = name if name is not None else func.__name__
         Func.__doc__ = func.__doc__
@@ -59,10 +67,49 @@ def function(intypes, outtype, pass_context=False, name=None):
     return decorator
 
 
+def register(name=None):
+    def decorator(cls):
+        if name is not None:
+            cls.__name__ = name
+        query_compile.FUNCTIONS[cls.__name__].append(cls)
+        return cls
+    return decorator
+
+
+@register('getitem')
+class GetItem2(query_compile.EvalFunction):
+    __intypes__ = [dict, str]
+
+    def __init__(self, context, operands):
+        super().__init__(context, operands, object)
+
+    def __call__(self, row):
+        obj, key = self.operands
+        obj = obj(row)
+        if obj is None:
+            return None
+        return obj.get(key(row))
+
+
+@register('getitem')
+class GetItem3(query_compile.EvalFunction):
+    __intypes__ = [dict, str, types.Any]
+
+    def __init__(self, context, operands):
+        super().__init__(context, operands, object)
+
+    def __call__(self, row):
+        obj, key, default = self.operands
+        obj = obj(row)
+        if obj is None:
+            return None
+        return obj.get(key(row), default(row))
+
+
 def Function(name, args):
     func = types.function_lookup(query_compile.FUNCTIONS, name, args)
     if func is not None:
-        return func(args)
+        return func(None, args)
     raise KeyError
 
 
@@ -234,8 +281,8 @@ def quarter(x):
     return '{:04d}-Q{:1d}'.format(x.year, (x.month - 1) // 3 + 1)
 
 
-@function([datetime.date], str)
-def weekday(x):
+@function([datetime.date], str, name='weekday')
+def weekday_(x):
     """Extract a 3-letter weekday from a date."""
     return x.strftime('%a')
 
@@ -248,8 +295,9 @@ def today():
 
 # Operations on accounts.
 
+@function([str], str)
 @function([str, int], str)
-def root(acc, n):
+def root(acc, n=1):
     """Get the root name(s) of the account."""
     return account.root(n, acc)
 
@@ -302,68 +350,59 @@ def lower(string):
     return string.lower()
 
 
+# Avoid building a tuple for each function invocation.
+NONENONE = None, None
+
+
 @function([str], datetime.date, pass_context=True)
 def open_date(context, acc):
     """Get the date of the open directive of the account."""
-    open_entry, _ = context.open_close_map[acc]
-    return open_entry.date if open_entry else None
+    open_entry, _ = context.tables['accounts'].accounts.get(acc, NONENONE)
+    if open_entry is None:
+        return None
+    return open_entry.date
 
 
 @function([str], datetime.date, pass_context=True)
 def close_date(context, acc):
     """Get the date of the close directive of the account."""
-    _, close_entry = context.open_close_map[acc]
-    return close_entry.date if close_entry else None
-
-
-@function([str], object, pass_context=True)
-def meta(context, key):
-    """Get some metadata key of the Posting."""
-    try:
-        return context.posting.meta[key]
-    # Postings for pad transactions have their meta fields set to
-    # None. See https://github.com/beancount/beancount/issues/767
-    except (AttributeError, KeyError, TypeError):
-        pass
-    return None
-
-
-@function([str], object, pass_context=True)
-def entry_meta(context, key):
-    """Get some metadata key of the parent directive (Transaction)."""
-    try:
-        return context.entry.meta[key]
-    except (AttributeError, KeyError):
-        pass
-    return None
-
-
-@function([str], object, pass_context=True)
-def any_meta(context, key):
-    """Get metadata from the posting or its parent transaction's metadata if not present."""
-    try:
-        return context.posting.meta[key]
-    # Postings for pad transactions have their meta fields set to
-    # None. See https://github.com/beancount/beancount/issues/767
-    except (AttributeError, KeyError, TypeError):
-        pass
-    try:
-        return context.entry.meta[key]
-    except (AttributeError, KeyError):
-        pass
-    return None
+    _, close_entry = context.tables['accounts'].accounts.get(acc, NONENONE)
+    if close_entry is None:
+        return None
+    return close_entry.date
 
 
 @function([str], dict, pass_context=True)
 @function([str, str], object, pass_context=True)
 def open_meta(context, account, key=None):
     """Get the metadata dict of the open directive of the account."""
-    entry, _ = context.open_close_map[account]
-    if entry is None:
+    open_entry, _ = context.tables['accounts'].accounts.get(account, NONENONE)
+    if open_entry is None:
         return None
     if key is None:
-        return entry.meta
-    return entry.meta.get(key)
+        return open_entry.meta
+    return open_entry.meta.get(key)
+
+
+# Stub kept only for function type checking and for generating documentation.
+@function([str], object)
+def meta(context, key):
+    """Get some metadata key of the posting."""
+    raise NotImplementedError
+
+
+# Stub kept only for function type checking and for generating documentation.
+@function([str], object)
+def entry_meta(context, key):
+    """Get some metadata key of the transaction."""
+    raise NotImplementedError
+
+
+# Stub kept only for function type checking and for generating documentation.
+@function([str], object)
+def any_meta(context, key):
+    """Get metadata from the posting or its parent transaction if not present."""
+    raise NotImplementedError
 
 
 @function([str], dict, pass_context=True)
@@ -372,7 +411,7 @@ def open_meta(context, account, key=None):
 @function([str, str], object, pass_context=True, name='commodity_meta')
 def currency_meta(context, commodity, key=None):
     """Get the metadata dict of the commodity directive of the currency."""
-    entry = context.commodity_map.get(commodity)
+    entry = context.tables['commodities'].commodities.get(commodity)
     if entry is None:
         return None
     if key is None:
@@ -383,15 +422,16 @@ def currency_meta(context, commodity, key=None):
 @function([str], str, pass_context=True)
 def account_sortkey(context, acc):
     """Get a string to sort accounts in order taking into account the types."""
-    index, name = account_types.get_account_sort_key(context.account_types, acc)
+    account_types = context.tables['accounts'].types
+    index, name = get_account_sort_key(account_types, acc)
     return '{}-{}'.format(index, name)
 
 
-@function([str], str, pass_context=True)
+# Stub kept only for function type checking and for generating documentation.
+@function([str], bool)
 def has_account(context, pattern):
     """True if the transaction has at least one posting matching the regular expression argument."""
-    search = re.compile(pattern, re.IGNORECASE).search
-    return any(search(account) for account in getters.get_entry_accounts(context.entry))
+    raise NotImplementedError
 
 
 # Note: Don't provide this, because polymorphic multiplication on Amount,
@@ -439,43 +479,49 @@ def inventory_cost(inv):
 @function([amount.Amount, str, datetime.date], amount.Amount, pass_context=True, name='convert')
 def convert_amount(context, amount_, currency, date=None):
     """Coerce an amount to a particular currency."""
-    return convert.convert_amount(amount_, currency, context.price_map, date)
+    price_map = context.tables['prices'].price_map
+    return convert.convert_amount(amount_, currency, price_map, date)
 
 
 @function([position.Position, str], amount.Amount, pass_context=True, name='convert')
 @function([position.Position, str, datetime.date], amount.Amount, pass_context=True, name='convert')
 def convert_position(context, pos, currency, date=None):
     """Coerce an amount to a particular currency."""
-    return convert.convert_position(pos, currency, context.price_map, date)
+    price_map = context.tables['prices'].price_map
+    return convert.convert_position(pos, currency, price_map, date)
 
 
 @function([inventory.Inventory, str], inventory.Inventory, pass_context=True, name='convert')
 @function([inventory.Inventory, str, datetime.date], inventory.Inventory, pass_context=True, name='convert')
 def convert_inventory(context, inv, currency, date=None):
     """Coerce an inventory to a particular currency."""
-    return inv.reduce(convert.convert_position, currency, context.price_map, date)
+    price_map = context.tables['prices'].price_map
+    return inv.reduce(convert.convert_position, currency, price_map, date)
 
 
 @function([position.Position], amount.Amount, pass_context=True, name='value')
 @function([position.Position, datetime.date], amount.Amount, pass_context=True, name='value')
 def position_value(context, pos, date=None):
     """Convert a position to its cost currency at the market value."""
-    return convert.get_value(pos, context.price_map, date)
+    price_map = context.tables['prices'].price_map
+    return convert.get_value(pos, price_map, date)
 
 
 @function([inventory.Inventory], inventory.Inventory, pass_context=True, name='value')
 @function([inventory.Inventory, datetime.date], inventory.Inventory, pass_context=True, name='value')
 def inventory_value(context, inv, date=None):
     """Coerce an inventory to its market value."""
-    return inv.reduce(convert.get_value, context.price_map, date)
+    price_map = context.tables['prices'].price_map
+    return inv.reduce(convert.get_value, price_map, date)
 
 
 @function([str, str], Decimal, pass_context=True)
 @function([str, str, datetime.date], Decimal, pass_context=True, name='getprice')
 def getprice(context, base, quote, date=None):
     """Fetch a price."""
+    price_map = context.tables['prices'].price_map
     pair = (base.upper(), quote.upper())
-    _, price = prices.get_price(context.price_map, pair, date)
+    _, price = prices.get_price(price_map, pair, date)
     return price
 
 
@@ -490,13 +536,6 @@ def number(x):
 def currency(x):
     """Extract the currency from an Amount."""
     return x.currency
-
-
-@function([dict, str], object, name='getitem')
-@function([dict, str, types.Any], object, name='getitem')
-def getitem_(x, key, default=None):
-    """Get value for the given key from a dict."""
-    return x.get(key, default)
 
 
 @function([str, set], str)
@@ -546,8 +585,30 @@ def filter_currency_inventory(inv, currency):
 @function([inventory.Inventory, str], inventory.Inventory, pass_context=True)
 def possign(context, x, account):
     """Correct sign of an Amount based on the usual balance of associated account."""
-    sign = account_types.get_account_sign(account, context.account_types)
+    account_types = context.tables['accounts'].types
+    sign = get_account_sign(account, account_types)
     return x if sign >= 0  else -x
+
+
+# ``date`` type
+
+class Date(types.Structure):
+    name = 'date'
+    columns = ColumnsRegistry()
+
+    @columns.register(int)
+    def year(x):
+        return x.year
+
+    @columns.register(int)
+    def month(x):
+        return x.month
+
+    @columns.register(int)
+    def day(x):
+        return x.day
+
+types.ALIASES[datetime.date] = Date
 
 
 @function([str], datetime.date)
@@ -571,6 +632,124 @@ def date_add(x, y):
     return x + datetime.timedelta(days=y)
 
 
+@function([str, datetime.date], datetime.date)
+def date_trunc(field, x):
+    """Truncate a date to the specified precision."""
+    if field == 'week':
+        return x - relativedelta(weekday=weekday(0, -1))
+    if field == 'month':
+        return datetime.date(x.year, x.month, 1)
+    if field == 'quarter':
+        return datetime.date(x.year, x.month - (x.month - 1) % 3, 1)
+    if field == 'year':
+        return datetime.date(x.year, 1, 1)
+    if field == 'decade':
+        return datetime.date(x.year - x.year % 10, 1, 1)
+    if field == 'century':
+        return datetime.date(x.year - (x.year - 1) % 100, 1, 1)
+    if field == 'millennium':
+        return datetime.date(x.year - (x.year - 1) % 1000, 1, 1)
+    return None
+
+
+@function([str, datetime.date], int)
+def date_part(field, x):
+    """Extract the specified field from a date."""
+    if field == 'weekday' or field == 'dow':
+        return x.weekday()
+    if field == 'isoweekday' or field == 'isodow':
+        return x.isoweekday()
+    if field == 'week':
+        # isocalendar() returns a named tuple only in Python >= 3.9.
+        return x.isocalendar()[1]
+    if field == 'month':
+        return x.month
+    if field == 'quarter':
+        return (x.month - 1) // 3 + 1
+    if field == 'year':
+        return x.year
+    if field == 'isoyear':
+        # isocalendar() returns a named tuple only in Python >= 3.9.
+        return x.isocalendar()[0]
+    if field == 'decade':
+        return x.year // 10
+    if field == 'century':
+        return (x.year - 1) // 100 + 1
+    if field == 'millennium':
+        return (x.year - 1) // 1000 + 1
+    if field == 'epoch':
+        return int((x - datetime.date(1970, 1, 1)).total_seconds())
+    return None
+
+
+@function([str], relativedelta)
+def interval(x):
+    """Construct a relative time interval."""
+    m = re.fullmatch(r'([-+]?[0-9]+)\s+(day|month|year)s?', x)
+    if not m:
+        return None
+    number = int(m.group(1))
+    unit = m.group(2)
+    if unit == 'day':
+        return relativedelta(days=number)
+    if unit == 'week':
+        return relativedelta(weeks=number)
+    if unit == 'month':
+        return relativedelta(months=number)
+    if unit == 'year':
+        return relativedelta(years=number)
+    if unit == 'decade':
+        return relativedelta(years=number * 10)
+    if unit == 'century':
+        return relativedelta(years=number * 100)
+    if unit == 'millennium':
+        return relativedelta(years=number * 1000)
+    return None
+
+
+@function([relativedelta, datetime.date, datetime.date], datetime.date)
+def date_bin(stride, source, origin):
+    """Bin a date into the specified stride aligned with the specified origin.
+
+    As an extension to the the SQL standard ``date_bin()`` function this
+    function also accepts strides containing units of months and years.
+    """
+    if stride.months or stride.years:
+        if origin + stride <= origin:
+            # FIXME: this should raise and error: stride must be greater than zero
+            return None
+        if source >= origin:
+            d = n = origin
+            while True:
+                n += stride
+                if n >= source:
+                    return d
+                d = n
+        else:
+            n = origin
+            while True:
+                n -= stride
+                if n <= source:
+                    return n
+    else:
+        seconds = stride.days * 86400 + stride.hours * 3600 + stride.minutes * 60 + stride.seconds
+        if seconds < 0:
+            # FIXME: this should raise and error: stride must be greater than zero
+            return None
+        diff = (source - origin).total_seconds()
+        modulo = diff % seconds
+        delta = diff - modulo
+        result = origin + datetime.timedelta(seconds=delta)
+        if modulo < 0:
+            result -= datetime.timedelta(seconds=seconds)
+        return result
+
+
+@function([str, datetime.date, datetime.date], datetime.date, name='date_bin')
+def date_bin_str(stride, source, origin):
+    return date_bin(interval(stride), source, origin)
+
+
 def aggregator(intypes, name=None):
     def decorator(cls):
         cls.__intypes__ = intypes
@@ -584,8 +763,8 @@ def aggregator(intypes, name=None):
 @aggregator([types.Asterisk], name='count')
 class Count(query_compile.EvalAggregator):
     """Count the number of input rows."""
-    def __init__(self, operands):
-        super().__init__(operands, int)
+    def __init__(self, context, operands):
+        super().__init__(context, operands, int)
 
     def update(self, store, context):
         store[self.handle] += 1
@@ -594,8 +773,8 @@ class Count(query_compile.EvalAggregator):
 @aggregator([types.Any], name='count')
 class CountArg(query_compile.EvalAggregator):
     """Count the number of non-NULL occurrences of the argument."""
-    def __init__(self, operands):
-        super().__init__(operands, int)
+    def __init__(self, context, operands):
+        super().__init__(context, operands, int)
 
     def update(self, store, context):
         value = self.operands[0](context)
@@ -606,8 +785,8 @@ class CountArg(query_compile.EvalAggregator):
 @aggregator([int], name='sum')
 class SumInt(query_compile.EvalAggregator):
     """Calculate the sum of the numerical argument."""
-    def __init__(self, operands):
-        super().__init__(operands, operands[0].dtype)
+    def __init__(self, context, operands):
+        super().__init__(context, operands, operands[0].dtype)
 
     def update(self, store, context):
         value = self.operands[0](context)
@@ -627,8 +806,8 @@ class SumDecimal(query_compile.EvalAggregator):
 @aggregator([amount.Amount], name='sum')
 class SumAmount(query_compile.EvalAggregator):
     """Calculate the sum of the amount. The result is an Inventory."""
-    def __init__(self, operands):
-        super().__init__(operands, inventory.Inventory)
+    def __init__(self, context, operands):
+        super().__init__(context, operands, inventory.Inventory)
 
     def update(self, store, context):
         value = self.operands[0](context)
@@ -639,8 +818,8 @@ class SumAmount(query_compile.EvalAggregator):
 @aggregator([position.Position], name='sum')
 class SumPosition(query_compile.EvalAggregator):
     """Calculate the sum of the position. The result is an Inventory."""
-    def __init__(self, operands):
-        super().__init__(operands, inventory.Inventory)
+    def __init__(self, context, operands):
+        super().__init__(context, operands, inventory.Inventory)
 
     def update(self, store, context):
         value = self.operands[0](context)
@@ -651,8 +830,8 @@ class SumPosition(query_compile.EvalAggregator):
 @aggregator([inventory.Inventory], name='sum')
 class SumInventory(query_compile.EvalAggregator):
     """Calculate the sum of the inventories. The result is an Inventory."""
-    def __init__(self, operands):
-        super().__init__(operands, inventory.Inventory)
+    def __init__(self, context, operands):
+        super().__init__(context, operands, inventory.Inventory)
 
     def update(self, store, context):
         value = self.operands[0](context)
@@ -709,418 +888,3 @@ class Max(query_compile.EvalAggregator):
             cur = store[self.handle]
             if cur is None or value > cur:
                 store[self.handle] = value
-
-
-class Row:
-    """A dumb container for information used by a row expression."""
-
-    rowid = None
-
-    # The current posting being evaluated.
-    posting = None
-
-    # The current transaction of the posting being evaluated.
-    entry = None
-
-    # The current running balance *after* applying the posting.
-    balance = None
-
-    # The parser's options_map.
-    options_map = None
-
-    # An AccountTypes tuple of the account types.
-    account_types = None
-
-    # A dict of account name strings to (open, close) entries for those accounts.
-    open_close_map = None
-
-    # A dict of currency name strings to the corresponding Commodity entry.
-    commodity_map = None
-
-    # A price dict as computed by build_price_map()
-    price_map = None
-
-    # A storage area for computing aggregate expression.
-    store = None
-
-    # The context hash is used in caching column accessor functions.
-    # Instead than hashing the row context content, use the rowid as
-    # hash.
-    def __hash__(self):
-        return self.rowid
-
-    def __init__(self, entries, options):
-        self.rowid = 0
-        self.balance = inventory.Inventory()
-        self.balance_update_rowid = -1
-        # Global properties used by some of the accessors.
-        self.options = options
-        self.account_types = opts.get_account_types(options)
-        self.open_close_map = getters.get_account_open_close(entries)
-        self.commodity_map = getters.get_commodity_directives(entries)
-        self.price_map = prices.build_price_map(entries)
-
-
-class BeanTable(tables.Table):
-    def __init__(self, entries, options, open=None, close=None, clear=None):
-        super().__init__()
-        self.entries = entries
-        self.options = options
-        self.open = open
-        self.close = close
-        self.clear = clear
-
-    @classmethod
-    def column(cls, dtype, name=None, help=None):
-        def decorator(func):
-            class Col(query_compile.EvalColumn):
-                def __init__(self):
-                    super().__init__(dtype)
-                __call__ = staticmethod(func)
-            Col.__name__ = name or func.__name__
-            Col.__doc__ = help or func.__doc__
-            cls.columns[Col.__name__] = Col()
-            return func
-        return decorator
-
-    def update(self, **kwargs):
-        table = copy.copy(self)
-        for name, value in kwargs.items():
-            setattr(table, name, value)
-        return table
-
-    def prepare(self):
-        """Filter the entries applying the FROM clause qualifiers OPEN, CLOSE, CLEAR."""
-        entries = self.entries
-        options = self.options
-
-        # Process the OPEN clause.
-        if self.open is not None:
-            entries, index = summarize.open_opt(entries, self.open, options)
-
-        # Process the CLOSE clause.
-        if self.close is not None:
-            if isinstance(self.close, datetime.date):
-                entries, index = summarize.close_opt(entries, self.close, options)
-            elif self.close is True:
-                entries, index = summarize.close_opt(entries, None, options)
-
-        # Process the CLEAR clause.
-        if self.clear is not None:
-            entries, index = summarize.clear_opt(entries, None, options)
-
-        return entries
-
-
-class EntriesTable(BeanTable):
-    name = 'entries'
-    columns = {}
-
-    def __iter__(self):
-        entries = self.prepare()
-        context = Row(entries, self.options)
-        for entry in entries:
-            context.entry = entry
-            context.rowid += 1
-            yield context
-
-
-column = EntriesTable.column
-
-
-@column(str, 'id')
-def id_(context):
-    """Unique id of a directive."""
-    return hash_entry(context.entry)
-
-
-@column(str, 'type')
-def type_(context):
-    """The data type of the directive."""
-    return type(context.entry).__name__.lower()
-
-
-@column(str)
-def filename(context):
-    """The filename where the directive was parsed from or created."""
-    return context.entry.meta["filename"]
-
-
-@column(int)
-def lineno(context):
-    """The line number from the file the directive was parsed from."""
-    return context.entry.meta["lineno"]
-
-
-@column(datetime.date)
-def date(context):
-    """The date of the directive."""
-    return context.entry.date
-
-
-@column(int)
-def year(context):
-    """The year of the date year of the directive."""
-    return context.entry.date.year
-
-
-@column(int)
-def month(context):
-    """The year of the date month of the directive."""
-    return context.entry.date.month
-
-
-@column(int)
-def day(context):
-    """The year of the date day of the directive."""
-    return context.entry.date.day
-
-
-@column(str)
-def flag(context):
-    """The flag the transaction."""
-    if not isinstance(context.entry, data.Transaction):
-        return None
-    return context.entry.flag
-
-
-@column(str)
-def payee(context):
-    """The payee of the transaction."""
-    if not isinstance(context.entry, data.Transaction):
-        return None
-    return context.entry.payee
-
-
-@column(str)
-def narration(context):
-    """The narration of the transaction."""
-    if not isinstance(context.entry, data.Transaction):
-        return None
-    return context.entry.narration
-
-
-@column(str)
-def description(context):
-    """A combination of the payee + narration of the transaction, if present."""
-    if not isinstance(context.entry, data.Transaction):
-        return None
-    return ' | '.join(filter(None, [context.entry.payee, context.entry.narration]))
-
-
-@column(set)
-def tags(context):
-    """The set of tags of the transaction."""
-    if not isinstance(context.entry, data.Transaction):
-        return None
-    return context.entry.tags
-
-
-@column(set)
-def links(context):
-    """The set of links of the transaction."""
-    if not isinstance(context.entry, data.Transaction):
-        return None
-    return context.entry.links
-
-
-@column(dict)
-def meta(context):
-    return context.entry.meta
-
-
-class PostingsTable(EntriesTable):
-    name = 'postings'
-    columns = EntriesTable.columns.copy()
-    wildcard_columns = 'date flag payee narration position'.split()
-
-    def __iter__(self):
-        entries = self.prepare()
-        context = Row(entries, self.options)
-        for entry in entries:
-            if isinstance(entry, data.Transaction):
-                context.entry = entry
-                for posting in entry.postings:
-                    context.rowid += 1
-                    context.posting = posting
-                    yield context
-
-
-column = PostingsTable.column
-
-
-# redefine EntriesTable's column definition to return posting information
-@column(str)
-def filename(context):
-    """The ledger where the posting is defined."""
-    return context.posting.meta["filename"]
-
-
-# redefine EntriesTable's column definition to return posting information
-@column(int)
-def lineno(context):
-    """The line number in the ledger file where the posting is defined."""
-    return context.posting.meta["lineno"]
-
-
-@column(str)
-def location(context):
-    """The filename:lineno location where the posting is defined."""
-    meta = context.posting.meta
-    return '{:s}:{:d}:'.format(meta['filename'], meta['lineno'])
-
-
-# redefine EntriesEnvironment's column dropping the entry type check.
-@column(str)
-def flag(context):
-    """The flag of the parent transaction for this posting."""
-    return context.entry.flag
-
-
-# redefine EntriesEnvironment's column dropping the entry type check.
-@column(str)
-def payee(context):
-    """The payee of the parent transaction for this posting."""
-    return context.entry.payee
-
-
-# redefine EntriesEnvironment's column dropping the entry type check.
-@column(str)
-def narration(context):
-    """The narration of the parent transaction for this posting."""
-    return context.entry.narration
-
-
-# redefine EntriesEnvironment's column dropping the entry type check.
-@column(str)
-def description(context):
-    "A combination of the payee + narration for the transaction of this posting."
-    return ' | '.join(filter(None, [context.entry.payee, context.entry.narration]))
-
-
-# redefine EntriesEnvironment's column dropping the entry type check.
-@column(set)
-def tags(context):
-    "The set of tags of the parent transaction for this posting."
-    return context.entry.tags
-
-
-# redefine EntriesEnvironment's column dropping the entry type check.
-@column(set)
-def links(context):
-    """The set of links of the parent transaction for this posting."""
-    return context.entry.links
-
-
-@column(str)
-def posting_flag(context):
-    """The flag of the posting itself."""
-    return context.posting.flag
-
-
-@column(str, 'account')
-def account_(context):
-    """The account of the posting."""
-    return context.posting.account
-
-
-@column(set)
-def other_accounts(context):
-    """The list of other accounts in the transaction, excluding that of this posting."""
-    return sorted({posting.account for posting in context.entry.postings if posting is not context.posting})
-
-
-@column(Decimal)
-def number(context):
-    """The number of units of the posting."""
-    return context.posting.units.number
-
-
-@column(str)
-def currency(context):
-    """The currency of the posting."""
-    return context.posting.units.currency
-
-
-@column(Decimal)
-def cost_number(context):
-    """The number of cost units of the posting."""
-    cost = context.posting.cost
-    return cost.number if cost else None
-
-
-@column(str)
-def cost_currency(context):
-    """The cost currency of the posting."""
-    cost = context.posting.cost
-    return cost.currency if cost else None
-
-
-@column(datetime.date)
-def cost_date(context):
-    """The cost currency of the posting."""
-    cost = context.posting.cost
-    return cost.date if cost else None
-
-
-@column(str)
-def cost_label(context):
-    """The cost currency of the posting."""
-    cost = context.posting.cost
-    return cost.label if cost else ''
-
-
-@column(position.Position, 'position')
-def position_(context):
-    """The position for the posting. These can be summed into inventories."""
-    posting = context.posting
-    return position.Position(posting.units, posting.cost)
-
-
-@column(amount.Amount)
-def price(context):
-    """The price attached to the posting."""
-    return context.posting.price
-
-
-@column(amount.Amount)
-def weight(context):
-    """The computed weight used for this posting."""
-    return convert.get_weight(context.posting)
-
-
-@column(inventory.Inventory)
-@cache(maxsize=1)
-def balance(context):
-    """The balance for the posting. These can be summed into inventories."""
-    # Caching protects against multiple balance updates per row when
-    # the columns appears more than once in the execurted query. The
-    # rowid in the row context guarantees that otherwise identical
-    # rows do not hit the cache and thus that the balance is correctly
-    # updated.
-    context.balance.add_position(context.posting)
-    return copy.copy(context.balance)
-
-
-@column(dict)
-def meta(context):
-    return context.posting.meta
-
-
-@column(data.Transaction)
-def entry(context):
-    return context.entry
-
-
-# Backward compatibility definitions for use in tests. These work
-# because the tests only access the columns definitions and these are
-# attached to the classes and not to the instances.
-
-def Column(name):
-    return PostingsTable.columns.get(name)
-
-def EntriesEnvironment():
-    return EntriesTable
-
-def PostingsEnvironment():
-    return PostingsTable

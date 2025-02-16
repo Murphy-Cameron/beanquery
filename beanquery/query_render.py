@@ -7,6 +7,7 @@ import collections
 import csv
 import datetime
 import enum
+import typing
 
 from decimal import Decimal
 
@@ -376,8 +377,8 @@ class InventoryRenderer(ColumnRenderer):
             # enabled or not.
             self.renderers[self.expand or pos.units.currency].update(pos)
         counts = collections.Counter(pos.units.currency for pos in value.get_positions())
-        for key, value in counts.items():
-            self.counts[key] = max(self.counts[key], value)
+        for key, val in counts.items():
+            self.counts[key] = max(self.counts[key], val)
 
     def prepare(self):
         if self.expand:
@@ -461,6 +462,7 @@ def render_rows(rows, renderers, ctx):
 
 
 def _get_renderer(datatype, ctx):
+    datatype = typing.get_origin(datatype) or datatype
     for d in datatype.__mro__:  # pragma: no branch
         renderer = RENDERERS.get(d)
         if renderer:

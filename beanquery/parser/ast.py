@@ -280,6 +280,10 @@ class NotMatch(BinaryOp):
     __slots__ = ()
 
 
+class Matches(BinaryOp):
+    __slots__ = ()
+
+
 # Membership operators.
 
 class In(BinaryOp):
@@ -308,3 +312,12 @@ class Add(BinaryOp):
 
 class Sub(BinaryOp):
     __slots__ = ()
+
+
+Any = node('Any', 'left op right')
+All = node('All', 'left op right')
+
+
+CreateTable = node('CreateTable', 'name columns using query')
+
+Insert = node('Insert', 'table columns values')

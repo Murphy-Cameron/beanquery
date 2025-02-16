@@ -4,22 +4,32 @@ This code accepts the abstract syntax tree produced by the query parser,
 resolves the column and function names, compiles and interpreter and prepares a
 query to be run against a list of entries.
 """
+
+from __future__ import annotations
+
 __copyright__ = "Copyright (C) 2014-2016  Martin Blais"
 __license__ = "GNU GPLv2"
 
 import collections
+import dataclasses
 import datetime
+import itertools
 import re
 import operator
 
 from decimal import Decimal
-from itertools import product
+from typing import List
 
+from dateutil.relativedelta import relativedelta
+
+from beanquery import cursor
 from beanquery.parser import ast
 from beanquery import query_execute
 from beanquery import types
 from beanquery import tables
 
+
+MARKER = object()
 
 FUNCTIONS = collections.defaultdict(list)
 OPERATORS = collections.defaultdict(list)
@@ -35,13 +45,9 @@ class EvalNode:
         self.dtype = dtype
 
     def __eq__(self, other):
-        """Override the equality operator to compare the data type and a all attributes
-        of this node. This is used by tests for comparing nodes.
-        """
-        return (isinstance(other, type(self))
-                and all(
-                    getattr(self, attribute) == getattr(other, attribute)
-                    for attribute in self.__slots__))
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        return all(getattr(self, attr) == getattr(other, attr) for attr in self.__slots__)
 
     def __str__(self):
         return "{}({})".format(type(self).__name__,
@@ -245,6 +251,10 @@ def mod_(x, y):
 @binaryop(ast.Add, [Decimal, int], Decimal)
 @binaryop(ast.Add, [int, Decimal], Decimal)
 @binaryop(ast.Add, [int, int], int)
+@binaryop(ast.Add, [str, str], str)
+@binaryop(ast.Add, [datetime.date, relativedelta], datetime.date)
+@binaryop(ast.Add, [relativedelta, datetime.date], datetime.date)
+@binaryop(ast.Add, [relativedelta, relativedelta], relativedelta)
 def add_(x, y):
     return x + y
 
@@ -253,6 +263,9 @@ def add_(x, y):
 @binaryop(ast.Sub, [Decimal, int], Decimal)
 @binaryop(ast.Sub, [int, Decimal], Decimal)
 @binaryop(ast.Sub, [int, int], int)
+@binaryop(ast.Sub, [datetime.date, relativedelta], datetime.date)
+@binaryop(ast.Sub, [relativedelta, datetime.date], datetime.date)
+@binaryop(ast.Sub, [relativedelta, relativedelta], datetime.date)
 def sub_(x, y):
     return x - y
 
@@ -285,6 +298,11 @@ def match_(x, y):
 @binaryop(ast.NotMatch, [str, str], bool)
 def not_match_(x, y):
     return not bool(re.search(y, x, re.IGNORECASE))
+
+
+@binaryop(ast.Matches, [str, str], bool)
+def matches_(x, y):
+    return bool(re.search(x, y))
 
 
 @binaryop(ast.In, [types.Any, set], bool)
@@ -331,7 +349,7 @@ _comparable = [
 ]
 
 for comparable in _comparable:
-    for intypes in product(comparable, repeat=3):
+    for intypes in itertools.product(comparable, repeat=3):
         class Between(EvalBetween):
             __intypes__ = list(intypes)
         OPERATORS[ast.Between].append(Between)
@@ -393,8 +411,9 @@ class EvalFunction(EvalNode):
     # Type constraints on the input arguments.
     __intypes__ = []
 
-    def __init__(self, operands, dtype):
+    def __init__(self, context, operands, dtype):
         super().__init__(dtype)
+        self.context = context
         self.operands = operands
 
 
@@ -428,6 +447,54 @@ class EvalGetter(EvalNode):
         return self.getter(operand)
 
 
+class EvalAny(EvalNode):
+    __slots__ = ('op', 'left', 'right')
+
+    def __init__(self, op, left, right):
+        super().__init__(bool)
+        self.op = op
+        self.left = left
+        self.right = right
+
+    def __call__(self, row):
+        left = self.left(row)
+        if left is None:
+            return None
+        right = self.right(row)
+        if right is None:
+            return None
+        return any(self.op(left, x) for x in right)
+
+
+class EvalAll(EvalNode):
+    __slots__ = ('op', 'left', 'right')
+
+    def __init__(self, op, left, right):
+        super().__init__(bool)
+        self.op = op
+        self.left = left
+        self.right = right
+
+    def __call__(self, row):
+        left = self.left(row)
+        if left is None:
+            return None
+        right = self.right(row)
+        if right is None:
+            return None
+        return all(self.op(left, x) for x in right)
+
+
+class EvalRow(EvalNode):
+    __slots__ = ()
+
+    def __init__(self):
+        super().__init__(object)
+
+    def __call__(self, context):
+        return context
+
+
 class EvalColumn(EvalNode):
     pass
 
@@ -435,8 +502,8 @@ class EvalColumn(EvalNode):
 class EvalAggregator(EvalFunction):
     pure = False
 
-    def __init__(self, operands, dtype=None):
-        super().__init__(operands, dtype or operands[0].dtype)
+    def __init__(self, context, operands, dtype=None):
+        super().__init__(context, operands, dtype or operands[0].dtype)
         self.value = None
 
     def allocate(self, allocator):
@@ -506,8 +573,25 @@ class SubqueryTable(tables.Table):
         return Column
 
     def __iter__(self):
-        columns, rows = query_execute.execute_query(self.subquery)
+        columns, rows = self.subquery()
         return iter(rows)
+
+
+class EvalConstantSubquery1D(EvalNode):
+    def __init__(self, subquery):
+        self.dtype = List[subquery.columns[0].c_expr.dtype]
+        self.subquery = subquery
+        self.value = MARKER
+
+    def __call__(self, context):
+        if self.value is MARKER:
+            # Subqueries accessing the current row are not supported yet,
+            # thus the subquery result can be simply cached.
+            columns, rows = self.subquery()
+            value = [row[0] for row in rows]
+            # Subqueries not returning any row are threates as NULL.
+            self.value = value if value else None
+        return self.value
 
 
 # A compiled target.
@@ -534,27 +618,88 @@ EvalTarget = collections.namedtuple('EvalTarget', 'c_expr name is_aggregate')
 #     This list may refer to either aggregates or non-aggregates.
 #   limit: An optional integer used to cut off the number of result rows returned.
 #   distinct: An optional boolean that requests we should uniquify the result rows.
-EvalQuery = collections.namedtuple('EvalQuery', ('table c_targets c_where '
-                                                 'group_indexes having_index '
-                                                 'order_spec '
-                                                 'limit distinct'))
+@dataclasses.dataclass
+class EvalQuery:
+    table: tables.Table
+    c_targets: list
+    c_where: EvalNode
+    group_indexes: list[int]
+    having_index: int
+    order_spec: list[tuple[int, ast.Ordering]]
+    limit: int
+    distinct: bool
+
+    @property
+    def columns(self):
+        return [t for t in self.c_targets if t.name is not None]
+
+    def __call__(self):
+        return query_execute.execute_select(self)
 
 
-# A compiled query with a PIVOT BY clause.
-#
-# The PIVOT BY clause causes the structure of the returned table to be
-# fundamentally alterede, thus it makes sense to model it as a
-# distinct operation.
-#
-# Attributes:
-#   query: The underlying EvalQuery.
-#   pivots: The pivot columns indexes
-EvalPivot = collections.namedtuple('EvalPivot', 'query pivots')
+@dataclasses.dataclass
+class EvalPivot:
+    """Implement PIVOT BY clause."""
+
+    query: EvalQuery
+    pivots: list[int]
+
+    def __call__(self):
+        columns, rows = self.query()
+
+        col1, col2 = self.pivots
+        othercols = [i for i in range(len(columns)) if i not in self.pivots]
+        nother = len(othercols)
+        other = lambda x: tuple(x[i] for i in othercols)
+        keys = sorted({row[col2] for row in rows})
+
+        # Compute the new column names and dtypes.
+        if nother > 1:
+            it = itertools.product(keys, other(columns))
+            names = [f'{columns[col1].name}/{columns[col2].name}'] + [f'{key}/{col.name}' for key, col in it]
+        else:
+            names = [f'{columns[col1].name}/{columns[col2].name}'] + [f'{key}' for key in keys]
+        datatypes = [columns[col1].datatype] + [col.datatype for col in other(columns)] * len(keys)
+        columns = tuple(cursor.Column(name, datatype) for name, datatype in zip(names, datatypes))
+
+        # Populate the pivoted table.
+        pivoted = []
+        rows.sort(key=operator.itemgetter(col1))
+        for field1, group in itertools.groupby(rows, key=operator.itemgetter(col1)):
+            outrow = [field1] + [None] * (len(columns) - 1)
+            for row in group:
+                index = keys.index(row[col2]) * nother + 1
+                outrow[index:index+nother] = other(row)
+            pivoted.append(tuple(outrow))
+
+        return columns, pivoted
 
 
-# A compiled print statement, ready for execution.
-#
-# Attributes:
-#   table: Table to print
-#   where: Filtering expression, EvalNode instance.
-EvalPrint = collections.namedtuple('EvalPrint', 'table where')
+@dataclasses.dataclass
+class EvalCreateTable:
+    context: object = dataclasses.field(repr=False)
+    name: str
+    columns: list[tuple[str, str]]
+    using: str
+    data: EvalQuery | None
+    create: object = dataclasses.field(repr=False)
+
+    def __call__(self):
+        table = self.create(self.name, self.columns, self.using)
+        if self.data is not None:
+            columns, rows = self.data()
+            for row in rows:
+                table.insert(row)
+        self.context.tables[self.name] = table
+        return (), []
+
+
+@dataclasses.dataclass
+class EvalInsert:
+    table: tables.Table
+    values: list[EvalNode]
+
+    def __call__(self):
+        values = tuple(value(None) for value in self.values)
+        self.table.insert(values)
+        return (), []

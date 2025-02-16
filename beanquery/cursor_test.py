@@ -2,7 +2,7 @@ import unittest
 import sqlite3
 
 import beanquery
-from beanquery.tests import tables
+from beanquery.sources import test
 
 
 class APITests:
@@ -73,10 +73,14 @@ class TestSQLite(APITests, unittest.TestCase):
         curs.execute('CREATE TABLE test (x int)')
         curs.executemany('INSERT INTO test VALUES (?)', [(i, ) for i in range(16)])
 
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+
 
 class TestBeanquery(APITests, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.table = '#test'
         cls.conn = beanquery.Connection()
-        cls.conn.tables['test'] = tables.TestTable(0, 16)
+        cls.conn.tables['test'] = test.Table(16)

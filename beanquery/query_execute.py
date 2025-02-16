@@ -7,42 +7,25 @@ import collections
 import itertools
 import operator
 
-from beancount.core import display_context
-from beancount.parser import printer
-
 from . import compiler
-from . import query_compile
-from .cursor import Column
+from . import hashable
+from . import cursor
 
 
-def uniquify(iterable):
-    seen = set()
-    for obj in iterable:
-        if obj not in seen:
-            seen.add(obj)
-            yield obj
 
+class Unique:
+    def __init__(self, columns):
+        self.wrap = hashable.make(columns)
 
-def execute_print(c_print, file):
-    """Print entries from a print statement specification.
-
-    Args:
-      c_print: An instance of a compiled EvalPrint statement.
-      file: The output file to print to.
-    """
-    # Filter the entries with the FROM clause expression.
-    entries = []
-    expr = c_print.where
-    for row in c_print.table:
-        if expr is None or expr(row):
-            entries.append(row.entry)
-
-    # Create a context that renders all numbers with their natural
-    # precision, but honors the commas option. This is kept in sync with
-    # {2c694afe3140} to avoid a dependency.
-    dcontext = display_context.DisplayContext()
-    dcontext.set_commas(c_print.table.options['dcontext'].commas)
-    printer.print_entries(entries, dcontext, file=file)
+    def __call__(self, iterable):
+        wrap = self.wrap
+        seen = set()
+        add = seen.add
+        for obj in iterable:
+            h = wrap(obj)
+            if h not in seen:
+                add(h)
+                yield obj
 
 
 class Allocator:
@@ -118,57 +101,6 @@ def nullitemgetter(item, *items):
     return func
 
 
-def execute_query(query):
-    """Given a compiled select statement, execute the query.
-
-    Args:
-      query: The query to execute.
-      entries: A list of directives.
-      options: A parser's option_map.
-
-    Returns:
-        A list of (name, dtype) tuples describing the results set
-        table and a list of ResultRow tuples with the data.item pairs.
-
-    """
-
-    if isinstance(query, query_compile.EvalQuery):
-        return execute_select(query)
-
-    if isinstance(query, query_compile.EvalPivot):
-        columns, rows = execute_select(query.query)
-
-        col1, col2 = query.pivots
-        othercols = [i for i in range(len(columns)) if i not in query.pivots]
-        nother = len(othercols)
-        other = lambda x: tuple(x[i] for i in othercols)
-        keys = sorted({row[col2] for row in rows})
-
-        # Compute the new column names and dtypes.
-        if nother > 1:
-            it = itertools.product(keys, other(columns))
-            names = [f'{columns[col1].name}/{columns[col2].name}'] + [f'{key}/{col.name}' for key, col in it]
-        else:
-            names = [f'{columns[col1].name}/{columns[col2].name}'] + [f'{key}' for key in keys]
-        datatypes = [columns[col1].datatype] + [col.datatype for col in other(columns)] * len(keys)
-        columns = tuple(Column(name, datatype) for name, datatype in zip(names, datatypes))
-
-        # Populate the pivoted table.
-        pivoted = []
-        rows.sort(key=operator.itemgetter(col1))
-        for field1, group in itertools.groupby(rows, key=operator.itemgetter(col1)):
-            outrow = [field1] + [None] * (len(columns) - 1)
-            for row in group:
-                index = keys.index(row[col2]) * nother + 1
-                outrow[index:index+nother] = other(row)
-            pivoted.append(tuple(outrow))
-
-        return columns, pivoted
-
-    # Not reached.
-    raise RuntimeError
-
-
 def execute_select(query):
     """Given a compiled select statement, execute the query.
 
@@ -183,7 +115,7 @@ def execute_select(query):
           'result_types'.
     """
     # Figure out the result types that describe what we return.
-    result_types = tuple(Column(target.name, target.c_expr.dtype)
+    result_types = tuple(cursor.Column(target.name, target.c_expr.dtype)
                          for target in query.c_targets
                          if target.name is not None)
 
@@ -298,7 +230,8 @@ def execute_select(query):
 
     # Apply DISTINCT.
     if query.distinct:
-        rows = uniquify(rows)
+        unique = Unique(result_types)
+        rows = unique(rows)
 
     # Apply LIMIT.
     if query.limit is not None:

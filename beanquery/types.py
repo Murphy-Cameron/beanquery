@@ -1,5 +1,11 @@
 import datetime
 import decimal
+import itertools
+import typing
+
+
+# Only Python >= 3.10 exposes NoneType in the types module.
+NoneType = type(None)
 
 
 class AnyType:
@@ -16,16 +22,9 @@ class AnyType:
 Any = AnyType()
 
 
-class AsteriskType:
-    __slots__ = ()
-    __name__ = '*'
-
-    def __eq__(self, other):
-        return isinstance(other, self.__class__)
-
-
 # Used for COUNT(*)
-Asterisk = AsteriskType()
+Asterisk = typing.NewType('*', object)  # noqa: PLC0132
+Asterisk.__mro__ = Asterisk,
 
 
 # Keep track of the defined structured types to allow introspection.
@@ -42,6 +41,20 @@ class Structure:
             TYPES[cls.name] = cls
 
 
+def _bases(t):
+    if t is NoneType:
+        return (object,)
+    bases = t.__mro__
+    if len(bases) > 1 and bases[-1] is object:
+        # All types that are not ``object`` have more than one class
+        # in their ``__mro__``. BQL uses ``object`` for untypes
+        # values. Do not return ``object`` as base for strict types,
+        # to avoid functions taking untyped onjects to accept all
+        # values.
+        return bases[:-1]
+    return bases
+
+
 def function_lookup(functions, name, operands):
     """Lookup a BQL function implementation.
 
@@ -53,10 +66,10 @@ def function_lookup(functions, name, operands):
     Returns:
       A EvalNode (or subclass) instance or None if the function was not found.
     """
-    intypes = [operand.dtype for operand in operands]
-    for func in functions[name]:
-        if func.__intypes__ == intypes:
-            return func
+    for signature in itertools.product(*(_bases(operand.dtype) for operand in operands)):
+        for func in functions[name]:
+            if func.__intypes__ == list(signature):
+                return func
     return None
 
 
@@ -77,4 +90,28 @@ ALIASES = {}
 
 
 def name(datatype):
+    if datatype is NoneType:
+        return 'NULL'
+    if isinstance(datatype, typing._GenericAlias):
+        return str(datatype).rsplit('.', 1)[-1].lower()
     return getattr(datatype, 'name', datatype.__name__.lower())
+
+
+_STRING_TO_DATATYPE = {
+    'bool': bool,
+    'date': datetime.date,
+    'decimal': decimal.Decimal,
+    'int': int,
+    'object': object,
+    'str': str,
+    'text': str,
+    'varchar': str,
+}
+
+
+def parse(name):
+    """Parse the string representation of a type into a type object.
+
+    This does not (yet) work for all supprted data types.
+    """
+    return _STRING_TO_DATATYPE.get(name, None)

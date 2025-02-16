@@ -13,25 +13,41 @@ from .errors import IntegrityError, InternalError, ProgrammingError, NotSupporte
 from .parser import ParseError
 
 
-__version__ = '0.1.dev0'
+__version__ = '0.1.dev1'
 
 
-def connect(dsn=None):
-    return Connection(dsn)
+# DB-API compliance
+apilevel = '2.0'
+threadsafety = 2
+paramstyle = 'pyformat'
+
+
+def connect(dsn, **kwargs):
+    return Connection(dsn, **kwargs)
 
 
 class Connection:
-    def __init__(self, dsn=None):
-        self.tables = {'': tables.NullTable()}
+    def __init__(self, dsn='', **kwargs):
+        self.tables = {None: tables.NullTable()}
+
+        # The ``None`` table is the default table. The ``''`` table is the
+        # table that is explicitly selected with ``FROM #``. Having the
+        # default table and the ``''`` table allows to select the empty table
+        # when the ``beancount`` data source is initialized and it sets the
+        # default table to the ``postings`` table.
+        self.tables[''] = self.tables[None]
+
+        # These are used only by the ``beancount`` data source.
         self.options = {}
         self.errors = []
-        if dsn is not None:
-            self.attach(dsn)
 
-    def attach(self, dsn):
+        if dsn:
+            self.attach(dsn, **kwargs)
+
+    def attach(self, dsn, **kwargs):
         scheme = urlparse(dsn).scheme
         source = importlib.import_module(f'beanquery.sources.{scheme}')
-        source.attach(self, dsn)
+        source.attach(self, dsn, **kwargs)
 
     def close(self):
         # Required by the DB-API.
@@ -66,5 +82,8 @@ __all__ = [
     'ParseError',
     'ProgrammingError',
     'Warning',
+    'apilevel',
     'connet',
+    'paramstyle',
+    'threadsafety',
 ]
